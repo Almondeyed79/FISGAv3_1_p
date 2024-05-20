@@ -1,0 +1,361 @@
+# İkinci hücre: Ana kodunuzu çalıştırın
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.stats as stats
+import ccxt
+import skfuzzy as fuzz
+from skfuzzy import control as ctrl
+
+# Binance API kullanarak veri çekmek için ccxt kullanımı
+exchange = ccxt.binance()
+
+# Tarihsel verileri çekmek için zaman aralıkları
+start_date = "2021-01-01T00:00:00Z"
+end_date = "2024-01-01T00:00:00Z"
+
+# Tarihsel mum (kline) verilerini çeken fonksiyon
+def get_historical_klines(symbol, timeframe, since, limit=None):
+    since_timestamp = exchange.parse8601(since)
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since_timestamp, limit)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    return df
+
+# Veri çerçevesinden işlem yapıyoruz
+df = get_historical_klines("AVAX/USDT", '1h', start_date)
+
+# Bollinger Bands hesaplama
+def calculate_bollinger_bands(data, window=20, num_of_std=2):
+    rolling_mean = data['close'].rolling(window).mean()
+    rolling_std = data['close'].rolling(window).std()
+    data['Upper Band'] = rolling_mean + (rolling_std * num_of_std)
+    data['Lower Band'] = rolling_mean - (rolling_std * num_of_std)
+    data['BBP'] = (data['close'] - data['Lower Band']) / (data['Upper Band'] - data['Lower Band'])
+
+calculate_bollinger_bands(df)
+
+# RSI hesaplama
+def calculate_rsi(data, window=14):
+    delta = data['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    data['RSI'] = 100 - (100 / (1 + rs))
+
+calculate_rsi(df)
+
+# ADX hesaplama
+def calculate_adx(data, window=14):
+    high = data['high']
+    low = data['low']
+    close = data['close']
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(window).mean()
+    plus_di = 100 * (plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)).rolling(window).mean() / atr
+    minus_di = 100 * (minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)).rolling(window).mean() / atr
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    data['ADX'] = dx.rolling(window).mean()
+
+calculate_adx(df)
+
+# EMA hesaplama
+def calculate_ema(data, window=20):
+    data['EMA20'] = data['close'].ewm(span=window, adjust=False).mean()
+    data['EMA20_change'] = (data['EMA20'] - data['EMA20'].shift(1)) / data['EMA20']
+
+calculate_ema(df)
+
+# Z-Score hesaplama
+def calculate_zscore(data, window=20):
+    data['Zscore'] = (data['close'] - data['EMA20']) / data['close'].rolling(window).std()
+
+calculate_zscore(df)
+
+# Next_Return hesaplaması: gelecek 5 barın toplam getirileri
+df['Next_Return'] = df['close'].pct_change().rolling(window=5).sum().shift(-5)
+df['OUTPUT'] = df['Next_Return']
+
+# Eksik verileri medyan ile doldurma
+df.fillna(df.median(), inplace=True)
+
+# Girdi ve çıktı değişkenleri aralıkları
+input_ranges = {
+    'BBP': (df['BBP'].min(), df['BBP'].max()),
+    'RSI': (df['RSI'].min(), df['RSI'].max()),
+    'ADX': (df['ADX'].min(), df['ADX'].max()),
+    'Zscore': (df['Zscore'].min(), df['Zscore'].max()),
+    'EMA20_change': (df['EMA20_change'].min(), df['EMA20_change'].max())
+}
+
+output_range = (-1, 1)
+
+# Genetik algoritma fonksiyonları
+
+def create_individual():
+    genes = np.random.randint(0, 2, 243).tolist()
+    genes.append(np.random.uniform(0.1, 100))  # 244. gen threshold değeri için
+    
+    # Üyelik fonksiyonları parametrelerini genlere ekleyelim
+    for key, (low, high) in input_ranges.items():
+        genes.append(np.random.uniform(low, high))  # Low parametresi
+        genes.append(np.random.uniform(low, high))  # Medium parametresi
+        genes.append(np.random.uniform(low, high))  # High parametresi
+
+    genes.append(np.random.uniform(*output_range))  # Output low
+    genes.append(np.random.uniform(*output_range))  # Output medium
+    genes.append(np.random.uniform(*output_range))  # Output high
+    
+    return genes
+
+def create_population(size):
+    return [create_individual() for _ in range(size)]
+
+def set_membership_functions(individual):
+    bbp = ctrl.Antecedent(np.arange(0, 1, 0.01), 'BBP')
+    rsi = ctrl.Antecedent(np.arange(0, 100, 1), 'RSI')
+    adx = ctrl.Antecedent(np.arange(0, 100, 1), 'ADX')
+    zscore = ctrl.Antecedent(np.arange(-3, 3, 0.1), 'Zscore')
+    ema20_change = ctrl.Antecedent(np.arange(-0.1, 0.1, 0.001), 'EMA20_change')
+    output = ctrl.Consequent(np.arange(-1, 1, 0.01), 'Output')
+
+    # Parametreleri sıralayıp düzgün bir şekilde ayarlama
+    bbp_params = np.sort([0, individual[244], individual[245], 1])
+    rsi_params = np.sort([0, individual[246], individual[247], 100])
+    adx_params = np.sort([0, individual[248], individual[249], 100])
+    zscore_params = np.sort([-3, individual[250], individual[251], 3])
+    ema20_change_params = np.sort([-0.1, individual[252], individual[253], 0.1])
+    output_params = np.sort([individual[254], individual[255], individual[256], -1, 1])
+
+    # Üyelik fonksiyonlarını ayarla
+    bbp['low'] = fuzz.trimf(bbp.universe, bbp_params[:3])
+    bbp['medium'] = fuzz.trimf(bbp.universe, bbp_params[1:4])
+    bbp['high'] = fuzz.trimf(bbp.universe, bbp_params[-3:])
+
+    rsi['low'] = fuzz.trimf(rsi.universe, rsi_params[:3])
+    rsi['medium'] = fuzz.trimf(rsi.universe, rsi_params[1:4])
+    rsi['high'] = fuzz.trimf(rsi.universe, rsi_params[-3:])
+
+    adx['low'] = fuzz.trimf(adx.universe, adx_params[:3])
+    adx['medium'] = fuzz.trimf(adx.universe, adx_params[1:4])
+    adx['high'] = fuzz.trimf(adx.universe, adx_params[-3:])
+
+    zscore['low'] = fuzz.trimf(zscore.universe, zscore_params[:3])
+    zscore['medium'] = fuzz.trimf(zscore.universe, zscore_params[1:4])
+    zscore['high'] = fuzz.trimf(zscore.universe, zscore_params[-3:])
+
+    ema20_change['low'] = fuzz.trimf(ema20_change.universe, ema20_change_params[:3])
+    ema20_change['medium'] = fuzz.trimf(ema20_change.universe, ema20_change_params[1:4])
+    ema20_change['high'] = fuzz.trimf(ema20_change.universe, ema20_change_params[-3:])
+
+    output['sell'] = fuzz.trimf(output.universe, output_params[:3])
+    output['neutral'] = fuzz.trimf(output.universe, output_params[1:4])
+    output['buy'] = fuzz.trimf(output.universe, output_params[-3:])
+
+    return bbp, rsi, adx, zscore, ema20_change, output
+
+def calculate_fitness(individual):
+    try:
+        active_rules = individual[:243]
+        threshold = individual[243]
+
+        bbp, rsi, adx, zscore, ema20_change, output = set_membership_functions(individual)
+
+        # Bulanık mantık kontrol sistemini kur
+        rules = []
+        states = ['low', 'medium', 'high']
+        for bbp_state in states:
+            for rsi_state in states:
+                for adx_state in states:
+                    for zscore_state in states:
+                        for ema20_change_state in states:
+                            if bbp_state == 'high' and rsi_state == 'low':
+                                rules.append(ctrl.Rule(bbp[bbp_state] & rsi[rsi_state] & adx[adx_state] & zscore[zscore_state] & ema20_change[ema20_change_state], output['sell']))
+                            elif bbp_state == 'low' and adx_state == 'high':
+                                rules.append(ctrl.Rule(bbp[bbp_state] & rsi[rsi_state] & adx[adx_state] & zscore[zscore_state] & ema20_change[ema20_change_state], output['buy']))
+                            else:
+                                rules.append(ctrl.Rule(bbp[bbp_state] & rsi[rsi_state] & adx[adx_state] & zscore[zscore_state] & ema20_change[ema20_change_state], output['neutral']))
+
+        output_ctrl = ctrl.ControlSystem(rules)
+        output_sim = ctrl.ControlSystemSimulation(output_ctrl)
+
+        output_values = []
+        for i in range(len(df)):
+            output_sim.input['BBP'] = df.iloc[i]['BBP']
+            output_sim.input['RSI'] = df.iloc[i]['RSI']
+            output_sim.input['ADX'] = df.iloc[i]['ADX']
+            output_sim.input['Zscore'] = df.iloc[i]['Zscore']
+            output_sim.input['EMA20_change'] = df.iloc[i]['EMA20_change']
+            output_sim.compute()
+            output_values.append(output_sim.output['Output'])
+
+        df['Fuzzy_Output'] = output_values
+
+        # Aktif olan kuralları belirle
+        buy_signals = df[df['Fuzzy_Output'] > df['Fuzzy_Output'].median() * threshold].copy()
+        
+        if buy_signals.empty or len(buy_signals) < 100:
+            return 0  # Eğer buy sinyali yoksa veya aktif satır sayısı 100'den azsa, fitness değeri 0 olsun
+        
+        buy_signals.loc[:, 'Cumulative_Return'] = (1 + buy_signals['Next_Return']).cumprod()
+        average_return = buy_signals['Cumulative_Return'].iloc[-1] / len(buy_signals)
+        
+        # Fitness değerini yazdır
+        print(f"Fitness: {average_return}")
+
+        return average_return  # Ortalama getiri değeri
+    
+    except ValueError:
+        return 0  # Hata durumunda fitness değeri 0 olsun
+
+def select_population(population, fitnesses, num_survivors):
+    sorted_population = [individual for _, individual in sorted(zip(fitnesses, population), reverse=True)]
+    return sorted_population[:num_survivors]
+
+def crossover(parent1, parent2):
+    crossover_point = np.random.randint(1, len(parent1))
+    child1 = parent1[:crossover_point] + parent2[crossover_point:]
+    child2 = parent2[:crossover_point] + parent1[crossover_point:]
+    return child1, child2
+
+def mutate(individual):
+    mutation_point = np.random.randint(0, len(individual))
+    if (mutation_point >= 244) and (mutation_point < 244 + 3 * len(input_ranges)):
+        key = list(input_ranges.keys())[(mutation_point - 244) // 3]
+        low, high = input_ranges[key]
+    elif mutation_point >= 244 + 3 * len(input_ranges):
+        low, high = output_range
+    elif mutation_point == 243:
+        low, high = 0.1, 100
+    else:
+        individual[mutation_point] = 1 - individual[mutation_point]
+        return individual
+
+    individual[mutation_point] = np.random.uniform(low, high)
+    return individual
+
+def genetic_algorithm(generations, population_size, num_survivors):
+    population = create_population(population_size)
+    best_individuals = []
+    all_individuals = []
+
+    for generation in range(generations):
+        print(f"Starting generation {generation}...")
+        fitnesses = []
+
+        for i, individual in enumerate(population):
+            fitness = calculate_fitness(individual)
+            fitnesses.append(fitness)
+            print(f"Generation {generation}, Individual {i}, Fitness: {fitness}")  # Her bireyin fitness skorunu yazdır
+
+        best_fitness = max(fitnesses)
+        best_index = fitnesses.index(best_fitness)
+        best_individual = population[best_index]
+        best_individuals.append(best_individual)
+
+        for ind, fit in zip(population, fitnesses):
+            all_individuals.append({
+                "Generation": generation,
+                "Fitness": fit,
+                "Threshold Multiplier": ind[243],
+                "Active Genes Count": sum(ind[:243]),
+                "Genes": ind[:243],
+                "Membership Parameters": ind[244:]
+            })
+
+        survivors = select_population(population, fitnesses, num_survivors)
+        new_population = survivors.copy()
+
+        while len(new_population) < population_size:
+            parent_indices = np.random.choice(len(survivors), 2, replace=False)
+            parent1 = survivors[parent_indices[0]]
+            parent2 = survivors[parent_indices[1]]
+            child1, child2 = crossover(parent1, parent2)
+            new_population.append(mutate(child1))
+            new_population.append(mutate(child2))
+
+        population = new_population[:population_size]
+
+        print(f"Completed generation {generation}.")
+        
+        top_10_indices = np.argsort(fitnesses)[-10:]
+        top_10_fitnesses = [fitnesses[i] for i in top_10_indices]
+        plt.figure(figsize=(10, 5))
+        plt.bar(range(1, 11), top_10_fitnesses, color='blue')
+        plt.title(f'Top 10 Fitness Scores - Generation {generation}')
+        plt.xlabel('Individual')
+        plt.ylabel('Fitness Score')
+        plt.show()
+
+        plt.figure(figsize=(10, 5))
+        plt.hist(fitnesses, bins=50, color='green', edgecolor='black')
+        plt.title(f'Fitness Score Distribution - Generation {generation}')
+        plt.xlabel('Fitness Score')
+        plt.ylabel('Frequency')
+        plt.show()
+
+    results_df = pd.DataFrame(all_individuals)
+    results_df['Generation'] = results_df['Generation'].astype(int)
+    results_df.sort_values(by=['Generation', 'Fitness'], ascending=[True, False], inplace=True)
+    results_df.reset_index(drop=True, inplace=True)
+
+    return results_df
+
+# Genetik algoritmayı çalıştır
+results = genetic_algorithm(generations=100, population_size=10000, num_survivors=100)
+print(results)
+
+# En yüksek fitness skoruna sahip bireyi bul
+best_individual = results.loc[results['Fitness'].idxmax()]
+
+# Bu bireyin genlerini ve threshold çarpanını al
+best_genes = best_individual['Genes']
+threshold_multiplier = best_individual['Threshold Multiplier']
+
+# Üyelik fonksiyonlarını ayarla
+bbp, rsi, adx, zscore, ema20_change, output = set_membership_functions(best_individual)
+
+# Bulanık mantık kontrol sistemini kur
+rules = []
+states = ['low', 'medium', 'high']
+for bbp_state in states:
+    for rsi_state in states:
+        for adx_state in states:
+            for zscore_state in states:
+                for ema20_change_state in states:
+                    if bbp_state == 'high' and rsi_state == 'low':
+                        rules.append(ctrl.Rule(bbp[bbp_state] & rsi[rsi_state] & adx[adx_state] & zscore[zscore_state] & ema20_change[ema20_change_state], output['sell']))
+                    elif bbp_state == 'low' and adx_state == 'high':
+                        rules.append(ctrl.Rule(bbp[bbp_state] & rsi[rsi_state] & adx[adx_state] & zscore[zscore_state] & ema20_change[ema20_change_state], output['buy']))
+                    else:
+                        rules.append(ctrl.Rule(bbp[bbp_state] & rsi[rsi_state] & adx[adx_state] & zscore[zscore_state] & ema20_change[ema20_change_state], output['neutral']))
+
+output_ctrl = ctrl.ControlSystem(rules)
+output_sim = ctrl.ControlSystemSimulation(output_ctrl)
+
+output_values = []
+for i in range(len(df)):
+    output_sim.input['BBP'] = df.iloc[i]['BBP']
+    output_sim.input['RSI'] = df.iloc[i]['RSI']
+    output_sim.input['ADX'] = df.iloc[i]['ADX']
+    output_sim.input['Zscore'] = df.iloc[i]['Zscore']
+    output_sim.input['EMA20_change'] = df.iloc[i]['EMA20_change']
+    output_sim.compute()
+    output_values.append(output_sim.output['Output'])
+
+df['Fuzzy_Output'] = output_values
+
+buy_signals = df[df['Fuzzy_Output'] > df['Fuzzy_Output'].median() * threshold_multiplier].copy()
+buy_signals.loc[:, 'Cumulative_Return'] = (1 + buy_signals['Next_Return']).cumprod()
+
+plt.figure(figsize=(10, 5))
+plt.plot(buy_signals.index, buy_signals['Cumulative_Return'], label='Cumulative Return', color='green')
+plt.title('Cumulative Return Using Best Individual Genes')
+plt.xlabel('Index')
+plt.ylabel('Cumulative Return')
+plt.legend()
+plt.grid(True)
+plt.show()
